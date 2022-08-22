@@ -31,12 +31,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from warnings import filterwarnings
-#filterwarnings(action='ignore', category=DeprecationWarning, message='is a deprecated alias')
-filterwarnings("ignore")
+filterwarnings("ignore")    #category=DeprecationWarning, message='is a deprecated alias'
 
 useSparseCNN = True
 if(useSparseCNN):
-    batchSize = 128
+    #set Runtime type = high RAM
+    batchSize = 128 #max value determined by numberOfSparseConvolutionLayers, numberOfchannelsFirstDenseLayer, GPU RAM
 else:
     batchSize = 128
 
@@ -184,17 +184,26 @@ class Cnn(nn.Module):
         stride = 1
         self.maxPoolSize = 2 #assume max pool at each layer
 
-        self.numberOfSparseConvolutions = 1
-        self.numberOfchannelsFirstDenseLayer = 32   #first/dense CNN layer 
+        self.numberOfSparseConvolutionLayers = 1 #default: 1 (1 or 2)
+        if(self.numberOfSparseConvolutionLayers == 1):
+            self.numberOfchannelsFirstDenseLayer = 32   #first/dense CNN layer
+        elif(self.numberOfSparseConvolutionLayers == 2):
+            self.numberOfchannelsFirstDenseLayer = 8    #first/dense CNN layer 
+        else:
+            print("useSparseCNN warning: numberOfSparseConvolutionLayers is too high for compute/memory")
+            self.numberOfchannelsFirstDenseLayer = 2
+
         numberOfchannels = self.numberOfchannelsFirstDenseLayer  
         self.conv1 = nn.Conv2d(1, numberOfchannels, kernel_size=kernelSize, padding=padding, stride=stride)
         height, width = self.getImageDimensionsAfterConv(height, width, kernelSize, padding, stride, self.maxPoolSize)
-        #print("self.numberOfchannelsFirstDenseLayer = ", self.numberOfchannelsFirstDenseLayer)
 
-        self.sparseConvList = [None]*self.numberOfSparseConvolutions
-        for c in range(self.numberOfSparseConvolutions):
+        self.sparseConvList = [None]*self.numberOfSparseConvolutionLayers
+        for c in range(self.numberOfSparseConvolutionLayers):
+            #print("c = ", c)
             if(useSparseCNN):
                 numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
+                #print("numberOfchannels = ", numberOfchannels)
+                #print("numChannelPairs = ", numChannelPairs)
                 self.sparseConvList[c] = []
                 numberOfInputChannels = 2
                 numberOfOutputChannels = 1
@@ -203,7 +212,6 @@ class Cnn(nn.Module):
                     self.sparseConvList[c].append(conv2)
                 height, width = self.getImageDimensionsAfterConv(height, width, kernelSize, padding, stride, self.maxPoolSize)
                 numberOfchannels = numChannelPairs*numberOfOutputChannels
-                #print("numberOfchannels = ", numberOfchannels)
             else:
                 numberOfInputChannels = numberOfchannels
                 numberOfOutputChannels = numberOfchannels*2
@@ -211,10 +219,8 @@ class Cnn(nn.Module):
                 height, width = self.getImageDimensionsAfterConv(height, width, kernelSize, padding, stride, self.maxPoolSize)
                 self.sparseConvList[c] = conv2
                 numberOfchannels = numberOfOutputChannels
-                #print("numberOfchannels = ", numberOfchannels)
 
         firstLinearInputSize = numberOfchannels*width*height
-        #print("firstLinearInputSize = ", firstLinearInputSize)
 
         self.conv2_drop = nn.Dropout2d(p=dropout)
         self.fc1 = nn.Linear(firstLinearInputSize, 100)
@@ -225,29 +231,28 @@ class Cnn(nn.Module):
         x = torch.relu(F.max_pool2d(self.conv1(x), kernel_size=self.maxPoolSize))
         numberOfchannels = self.numberOfchannelsFirstDenseLayer
 
-        for c in range(self.numberOfSparseConvolutions):
+        for c in range(self.numberOfSparseConvolutionLayers):
             if(useSparseCNN):
                 numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
                 channelsPairsList = self.convertToChannelsToChannelPairsList(x)
                 channelPairCNNoutputList = []
+                numberOfInputChannels = 2
+                numberOfOutputChannels = 1
                 for channelPairIndex in range(numChannelPairs):
-                    #print("channelPairIndex = ", channelPairIndex)
                     CNNin = channelsPairsList[channelPairIndex]
                     CNNout = (self.sparseConvList[c])[channelPairIndex](CNNin)
                     CNNout = torch.squeeze(CNNout, dim=1)   #remove channel dim (size=numberOfOutputChannels=1); prepare for convertChannelPairCNNoutputListToChannels execution
                     channelPairCNNoutputList.append(CNNout)
                 CNNout = self.convertChannelPairCNNoutputListToChannels(channelPairCNNoutputList)
+                numberOfchannels = numChannelPairs*numberOfOutputChannels
             else:
                 CNNin = x
                 CNNout = (self.sparseConvList[c])(CNNin)
             CNNout = torch.relu(F.max_pool2d(self.conv2_drop(CNNout), kernel_size=self.maxPoolSize))
             x = CNNout
 
-        # flatten over channel, height and width = 1600
+        # flatten over channel, height and width
         x = x.view(-1, x.size(1) * x.size(2) * x.size(3))
-
-        #print("CNNout.shape = ", CNNout.shape)
-        #print("x.shape = ", x.shape)
 
         x = torch.relu(self.fc1_drop(self.fc1(x)))
         x = torch.softmax(self.fc2(x), dim=-1)
@@ -256,8 +261,6 @@ class Cnn(nn.Module):
     def getImageDimensionsAfterConv(self, inputHeight, inputWidth, kernelSize, padding, stride, maxPoolSize):
         height = (inputHeight - (kernelSize//2 * 2) + padding) // stride // maxPoolSize    #// = integer floor division
         width = (inputWidth - (kernelSize//2 * 2) + padding) // stride // maxPoolSize
-        #print("getImageDimensionsAfterConv: inputHeight = ", inputHeight, ", height = ", height)
-        #print("getImageDimensionsAfterConv: inputWidth = ", inputWidth, ",width = ", width)
         return height, width
 
     def calculateNumberChannelPairs(self, numInputChannels):
@@ -268,18 +271,15 @@ class Cnn(nn.Module):
     def convertToChannelsToChannelPairsList(self, channels):
         batchSize, numberOfchannels, height, width = self.getCNNtensorProperties(channels)
         numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-        #print("numChannelPairs = ", numChannelPairs)
         channelsPairsList = []
         for channelIndex1 in range(numberOfchannels):
             for channelIndex2 in range(numberOfchannels):
-                channelPairIndex = channelIndex1*numChannelPairs + channelIndex2 
-                #conv1 = torch.zeros(batchSize, 2, height, width)  #pos embeddings absolute include x/y dim only
+                channelPairIndex = channelIndex1*numChannelPairs + channelIndex2
                 channelPairSub1 = channels[:, channelIndex1, :, :] 
                 channelPairSub2 = channels[:, channelIndex2, :, :]
                 channelPairSub1 = torch.unsqueeze(channelPairSub1, dim=1)
                 channelPairSub2 = torch.unsqueeze(channelPairSub2, dim=1)
                 channelPair = torch.cat((channelPairSub1, channelPairSub2), dim=1)
-                #print("channelPair.shape = ", channelPair.shape)
                 channelsPairsList.append(channelPair)
         return channelsPairsList
     
@@ -288,7 +288,6 @@ class Cnn(nn.Module):
         numberOfchannels = channels.shape[1]
         height = channels.shape[2]
         width = channels.shape[3]
-        #print("batchSize = ", batchSize)
         return batchSize, numberOfchannels, height, width
 
     def convertChannelPairCNNoutputListToChannels(self, channelPairCNNoutputList):
