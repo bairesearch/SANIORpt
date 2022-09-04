@@ -25,6 +25,7 @@ If you are running in colab, you should install the dependencies and download th
 
 ! [ ! -z "$COLAB_GPU" ] && pip install torch scikit-learn==0.20.* skorch
 
+from sklearn.metrics.cluster.supervised import fowlkes_mallows_score
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
 import numpy as np
@@ -35,21 +36,275 @@ filterwarnings("ignore")    #category=DeprecationWarning, message='is a deprecat
 
 useSparseNetwork = True
 if(useSparseNetwork):
-    #set Runtime type = high RAM
-    batchSizeMLP = 2048  
-    batchSizeCNN = 128  #max value determined by numberOfSparseConvolutionLayers, numberOfchannelsFirstDenseLayer, GPU RAM
-    numberOfEpochsMLP = 10  #10
-    numberOfEpochsCNN = 10  #10
+    paralleliseSparseProcessing = True   #parallel processing of sparse filters using Conv1d/Conv2d groups parameter
+    if(paralleliseSparseProcessing):
+        paralleliseSparseProcessingPrintTime = False
+        if(paralleliseSparseProcessingPrintTime):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+    
+    numberOfEpochsMLP = 1   #default: 10
+    numberOfEpochsCNN = 1   #default: 10
+    numberOfSparseLayersCNN = 2 #default: 1 (1 or 2)
+    numberOfSparseLayersMLP = 2 #default: 1 (1 or 2)
 else:
-    batchSizeMLP = 128
-    batchSizeCNN = 128
-    numberOfEpochsMLP = 20
-    numberOfEpochsCNN = 10
+    numberOfEpochsMLP = 1   #default: 20
+    numberOfEpochsCNN = 1   #default: 10
+    numberOfSparseLayersCNN = 1 #default: 1 #additional dense hidden layers
+    numberOfSparseLayersMLP = 1 #default: 0 #additional dense hidden layers
+
+#set Runtime type = high RAM
+#numberOfchannelsFirstDenseLayer: max value determined by numberOfSparseLayers, GPU RAM (independent of batchSize)
+
+#first/dense MLP layer;
+if(numberOfSparseLayersMLP == 0):
+    numberOfchannelsFirstDenseLayerMLP = 100	#hidden_dim
+    batchSizeMLP = 1024 #128
+elif(numberOfSparseLayersMLP == 1):
+    numberOfchannelsFirstDenseLayerMLP = 100
+    batchSizeMLP = 1024 #128
+elif(numberOfSparseLayersMLP == 2):
+    numberOfchannelsFirstDenseLayerMLP = 20 #2
+    batchSizeMLP = 1024 #128
+else:
+    print("useSparseNetwork warning: numberOfSparseLayersMLP is too high for compute/memory")
+    numberOfchannelsFirstDenseLayerMLP = 2
+    batchSizeMLP = 16
+    
+#first/dense CNN layer;
+if(numberOfSparseLayersCNN == 0):
+    numberOfchannelsFirstDenseLayerCNN = 32
+    batchSizeCNN = 4096    #1024
+elif(numberOfSparseLayersCNN == 1):
+    numberOfchannelsFirstDenseLayerCNN = 32
+    batchSizeCNN = 4096    #1024
+elif(numberOfSparseLayersCNN == 2):
+    numberOfchannelsFirstDenseLayerCNN = 8
+    batchSizeCNN = 4096    #1024
+else:
+    print("useSparseNetwork warning: numberOfSparseLayersCNN is too high for compute/memory")
+    numberOfchannelsFirstDenseLayerCNN = 2
+    batchSizeCNN = 16
 
 learningAlgorithmLUANN = False
 onlyTrainFinalLayer = False #initialise dependent var
 if(learningAlgorithmLUANN):
     onlyTrainFinalLayer = True
+
+"""## Sparse Layer Processing
+
+"""
+
+class SparseLayerProcessing():
+    def __init__(self, isCNNmodel, numberOfSparseLayers, layerDropout, numberOfchannelsFirstDenseLayer, kernelSize=None, padding=None, stride=None, maxPoolSize=None):
+
+        self.isCNNmodel = isCNNmodel
+
+        self.numberOfSparseLayers = numberOfSparseLayers
+        self.layerDropout = layerDropout
+        self.numberOfchannelsFirstDenseLayer = numberOfchannelsFirstDenseLayer
+        self.sparseLayerList = [None]*self.numberOfSparseLayers
+
+        if(isCNNmodel):
+            self.kernelSize = kernelSize
+            self.padding = padding
+            self.stride = stride
+            self.maxPoolSize = maxPoolSize
+
+    def generateSparseLayers(self, numberOfchannels, height=None, width=None):
+        for layerIndex in range(self.numberOfSparseLayers):
+            #print("layerIndex = ", layerIndex)
+            if(useSparseNetwork):
+                layer, numberOfchannels = self.generateSparseLayer(numberOfchannels)
+                self.sparseLayerList[layerIndex] = layer
+                if(self.isCNNmodel):
+                    height, width = self.getImageDimensionsAfterConv(height, width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
+            else:
+                #only used by CNN originally:
+                numberOfInputChannels = numberOfchannels
+                numberOfOutputChannels = numberOfchannels*2
+                layer = self.generateLayerStandard(numberOfchannels, numberOfOutputChannels)
+                self.sparseLayerList[layerIndex] = layer
+                numberOfchannels = numberOfOutputChannels
+                if(self.isCNNmodel):
+                    height, width = self.getImageDimensionsAfterConv(height, width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
+                
+        return numberOfchannels, height, width
+
+    def generateSparseLayer(self, numberOfchannels):
+        numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
+        #print("numberOfchannels = ", numberOfchannels)
+        #print("numChannelPairs = ", numChannelPairs)
+        numberOfInputChannels = 2
+        numberOfOutputChannels = 1
+        if(paralleliseSparseProcessing):
+            layer = self.generateSparseLayerParallel(numChannelPairs, numberOfInputChannels, numberOfOutputChannels)
+        else:
+            layer = self.generateSparseLayerStandard(numChannelPairs, numberOfInputChannels, numberOfOutputChannels)
+        numberOfchannels = numChannelPairs*numberOfOutputChannels
+        return layer, numberOfchannels
+    def generateSparseLayerStandard(self, numChannelPairs, numberOfInputChannels, numberOfOutputChannels):
+        sparseSublayerList = []
+        for channelPairIndex in range(numChannelPairs):
+            sublayer = self.generateLayerStandard(numberOfInputChannels, numberOfOutputChannels)
+            sparseSublayerList.append(sublayer)
+        return sparseSublayerList
+    def generateSparseLayerParallel(self, numChannelPairs, numberOfInputChannels, numberOfOutputChannels):
+        layer = self.generateLayerParallel(numChannelPairs, numberOfInputChannels, numberOfOutputChannels)
+        return layer
+
+    def generateLayerParallel(self, numChannelPairs, numberOfInputChannels, numberOfOutputChannels):
+        if(self.isCNNmodel):
+            return self.generateLayerParallelCNN(numChannelPairs, numberOfInputChannels, numberOfOutputChannels)
+        else:
+            return self.generateLayerParallelMLP(numChannelPairs, numberOfInputChannels, numberOfOutputChannels)
+    def generateLayerParallelMLP(self, numChannelPairs, numberOfInputChannels, numberOfOutputChannels):
+        #https://stackoverflow.com/questions/58374980/run-multiple-models-of-an-ensemble-in-parallel-with-pytorch/58389075#58389075
+        layer = nn.Conv1d(numberOfInputChannels*numChannelPairs, numberOfOutputChannels*numChannelPairs, kernel_size=1, groups=numChannelPairs)
+        return layer
+    def generateLayerParallelCNN(self, numChannelPairs, numberOfInputChannels, numberOfOutputChannels):
+        conv2DnumberSubChannels = numberOfInputChannels*numChannelPairs
+        layer = nn.Conv2d(conv2DnumberSubChannels, conv2DnumberSubChannels, kernel_size=self.kernelSize, padding=self.padding, stride=self.stride, groups=conv2DnumberSubChannels)
+        return layer
+
+    def generateLayerStandard(self, numberOfInputChannels, numberOfOutputChannels):
+        if(self.isCNNmodel):
+            return self.generateLayerStandardCNN(numberOfInputChannels, numberOfOutputChannels)
+        else:
+            return self.generateLayerStandardMLP(numberOfInputChannels, numberOfOutputChannels)
+    def generateLayerStandardMLP(self, numberOfInputChannels, numberOfOutputChannels):
+        layer = nn.Linear(numberOfInputChannels, numberOfOutputChannels)
+        return layer
+    def generateLayerStandardCNN(self, numberOfInputChannels, numberOfOutputChannels):
+        layer = nn.Conv2d(numberOfInputChannels, numberOfOutputChannels, kernel_size=self.kernelSize, padding=self.padding, stride=self.stride)
+        return layer
+
+    def executeSparseLayers(self, X):
+        numberOfchannels = self.numberOfchannelsFirstDenseLayer
+        for layerIndex in range(self.numberOfSparseLayers):
+            if(useSparseNetwork):
+                layerZ, numberOfchannels = self.executeSparseLayer(layerIndex, X, numberOfchannels)
+            else:
+                layerIn = X
+                layerZ = (self.sparseLayerList[layerIndex])(layerIn)
+            layerOut = self.activationFunction(layerZ)
+            X = layerOut
+        return X
+    
+    def executeSparseLayer(self, layerIndex, X, numberOfchannels):
+        numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
+        numberOfInputChannels = 2
+        numberOfOutputChannels = 1
+        channelsPairsList = self.convertToChannelsToChannelPairsList(X)
+        if(paralleliseSparseProcessing):
+            layerZ = self.executeSparseLayerParallel(layerIndex, channelsPairsList, numChannelPairs)
+        else:
+            layerZ = self.executeSparseLayerStandard(layerIndex, channelsPairsList, numChannelPairs)
+        numberOfchannels = numChannelPairs*numberOfOutputChannels
+        return layerZ, numberOfchannels
+    def executeSparseLayerStandard(self, layerIndex, channelsPairsList, numChannelPairs):
+        channelPairSublayerOutputList = []
+        for channelPairIndex in range(numChannelPairs):
+            sublayerIn = channelsPairsList[channelPairIndex]
+            sublayerOut = (self.sparseLayerList[layerIndex])[channelPairIndex](sublayerIn)
+            sublayerOut = torch.squeeze(sublayerOut, dim=1)   #remove channel dim (size=numberOfOutputChannels=1); prepare for convertChannelPairLINoutputListToChannels execution
+            channelPairSublayerOutputList.append(sublayerOut)
+        layerZ = self.convertChannelPairSublayerOutputListToChannels(channelPairSublayerOutputList)
+        return layerZ
+    def executeSparseLayerParallel(self, layerIndex, channelsPairsList, numChannelPairs):
+        firstTensorInList = channelsPairsList[0]    #shape = [batchSize, numberOfInputChannels, ..]
+        print("executeSparseLayerParallel: layerIndex = ", layerIndex, ", firstTensorInList.shape = ", firstTensorInList.shape, ", numChannelPairs = ", numChannelPairs)
+        tensorPropertiesTuple = self.getSublayerTensorProperties(firstTensorInList)   #get properties from first tensor in list
+        #numChannelPairs = len(channelsPairsList)
+        channelsPairs = torch.stack(channelsPairsList, dim=1)   #shape = [batchSize, numChannelPairs, numberOfInputChannels, ..]
+        if(self.isCNNmodel):
+            if(paralleliseSparseProcessingPrintTime):
+                start.record()
+            (batchSize, numberOfInputChannels, height, width) = tensorPropertiesTuple
+            conv2DnumberSubChannels = numberOfInputChannels*numChannelPairs
+            layerIn = torch.reshape(channelsPairs, (batchSize, numChannelPairs*numberOfInputChannels, height, width))
+            layerZ = (self.sparseLayerList[layerIndex])(layerIn)  #channels convoluted separately (in separate groups)
+            height, width = self.getImageDimensionsAfterConv(height, width, self.kernelSize, self.padding, self.stride, 1)  #no max pool has been performed
+            layerZ = torch.reshape(layerZ, (batchSize, numChannelPairs, numberOfInputChannels, height, width))
+            layerZ = torch.sum(layerZ, dim=2)  #take sum of numberOfInputChannels (emulates element-wise sum as performed by CNN with groups=1)
+            if(paralleliseSparseProcessingPrintTime):
+                end.record()
+                torch.cuda.synchronize()
+                print(start.elapsed_time(end))
+        else:
+            (batchSize, numberOfInputChannels) = tensorPropertiesTuple
+            #https://stackoverflow.com/questions/58374980/run-multiple-models-of-an-ensemble-in-parallel-with-pytorch/58389075#58389075
+            layerIn = torch.reshape(channelsPairs, (batchSize, numChannelPairs*numberOfInputChannels, 1))
+            layerZ = (self.sparseLayerList[layerIndex])(layerIn)
+            layerZ = torch.reshape(layerZ, (batchSize, numChannelPairs))
+        print("executeSparseLayerParallel: layerZ.shape = ", layerZ.shape)
+        #layerZ shape = [batchSize, numChannelPairs, ..]
+        return layerZ
+
+    def activationFunction(self, Z, useDropOut=True):
+        if(self.isCNNmodel):
+            return self.activationFunctionCNN(Z, useDropOut)
+        else:
+            return self.activationFunctionMLP(Z, useDropOut)
+    def activationFunctionMLP(self, Z, useDropOut=True):
+        A = F.relu(Z)
+        if(useDropOut):
+            A = self.layerDropout(A)
+        return A
+    def activationFunctionCNN(self, Z, useDropOut=True):
+        if(useDropOut):
+            Z = self.layerDropout(Z)
+        A = torch.relu(F.max_pool2d(Z, kernel_size=self.maxPoolSize))
+        return A
+
+    def calculateNumberChannelPairs(self, numInputChannels):
+        numChannelPairs = numInputChannels**2
+        return numChannelPairs
+        #numOutputChannels = number of filters
+
+    def convertToChannelsToChannelPairsList(self, channels):
+        tensorPropertiesTuple = self.getSublayerTensorProperties(channels)
+        batchSize = tensorPropertiesTuple[0]
+        numberOfchannels = tensorPropertiesTuple[1]
+        numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
+        channelsPairsList = []
+        for channelIndex1 in range(numberOfchannels):
+            for channelIndex2 in range(numberOfchannels):
+                channelPairIndex = channelIndex1*numChannelPairs + channelIndex2
+                channelPairSub1 = channels[:, channelIndex1]  #channels[:, channelIndex1, :]
+                channelPairSub2 = channels[:, channelIndex2]  #channels[:, channelIndex2, :]
+                channelPairSub1 = torch.unsqueeze(channelPairSub1, dim=1)
+                channelPairSub2 = torch.unsqueeze(channelPairSub2, dim=1)
+                channelPair = torch.cat((channelPairSub1, channelPairSub2), dim=1)
+                channelsPairsList.append(channelPair)
+        return channelsPairsList
+
+    def getSublayerTensorProperties(self, channels):
+        if(self.isCNNmodel):
+            return self.getCNNtensorProperties(channels)
+        else:
+            return self.getMLPtensorProperties(channels)
+    def getMLPtensorProperties(self, channels):
+        batchSize = channels.shape[0]
+        numberOfchannels = channels.shape[1]
+        tensorPropertiesTuple = (batchSize, numberOfchannels)
+        return tensorPropertiesTuple
+    def getCNNtensorProperties(self, channels):
+        batchSize = channels.shape[0]
+        numberOfchannels = channels.shape[1]
+        height = channels.shape[2]
+        width = channels.shape[3]
+        tensorPropertiesTuple = (batchSize, numberOfchannels, height, width)
+        return tensorPropertiesTuple
+
+    def convertChannelPairSublayerOutputListToChannels(self, channelPairSublayerOutputList):
+        layerZ = torch.stack(channelPairSublayerOutputList, dim=1)
+        return layerZ
+
+    def getImageDimensionsAfterConv(self, inputHeight, inputWidth, kernelSize, padding, stride, maxPoolSize):
+        height = (inputHeight - (kernelSize//2 * 2) + padding) // stride // maxPoolSize    #// = integer floor division
+        width = (inputWidth - (kernelSize//2 * 2) + padding) // stride // maxPoolSize
+        return height, width
 
 """## Loading Data
 Using SciKit-Learns ```fetch_openml``` to load MNIST data.
@@ -114,13 +369,7 @@ mnist_dim, hidden_dim, output_dim
 """A Neural network in PyTorch's framework."""
 
 class MLPModel(nn.Module):
-    def __init__(
-            self,
-            input_dim=mnist_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            dropout=0.5,
-    ):
+    def __init__(self, input_dim=mnist_dim, hidden_dim=hidden_dim, output_dim=output_dim, dropout=0.5):
         super(MLPModel, self).__init__()
 
         self.isCNNmodel = False
@@ -128,67 +377,26 @@ class MLPModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         #print("hidden_dim = ", hidden_dim)
-        self.numberOfSparseLayers = 1 #default: 1 (1 or 2)
-        if(self.numberOfSparseLayers == 1):
-            self.numberOfchannelsFirstDenseLayer = 100   #first/dense linear layer   #hidden_dim?
-        elif(self.numberOfSparseLayers == 2):
-            self.numberOfchannelsFirstDenseLayer = 10    #first/dense linear layer #hidden_dim?
-        else:
-            print("useSparseNetwork warning: numberOfSparseConvolutionLayers is too high for compute/memory")
-            self.numberOfchannelsFirstDenseLayer = 2
+        self.numberOfSparseLayers = numberOfSparseLayersMLP   #default: 1 (1 or 2)
+        self.numberOfchannelsFirstDenseLayer = numberOfchannelsFirstDenseLayerMLP
 
         numberOfchannels = self.numberOfchannelsFirstDenseLayer 
 
-        self.linear1 = nn.Linear(input_dim, numberOfchannels)
+        self.linear1 = nn.Linear(input_dim, numberOfchannels)  #first/dense linear layer 
 
-        self.sparseLayerList = [None]*self.numberOfSparseLayers
-        numberOfchannels = self.generateSparseLayers(numberOfchannels, self.sparseLayerList, self.numberOfSparseLayers)
+        self.sparseLayerProcessing = SparseLayerProcessing(self.isCNNmodel, self.numberOfSparseLayers, self.dropout, self.numberOfchannelsFirstDenseLayer)
+
+        numberOfchannels, _, _ = self.sparseLayerProcessing.generateSparseLayers(numberOfchannels)
 
         self.output = nn.Linear(numberOfchannels, output_dim)
-
-    def generateSparseLayers(self, numberOfchannels, sparseLayerList, numberOfSparseLayers):
-        for c in range(numberOfSparseLayers):
-            #print("c = ", c)
-            if(useSparseNetwork):
-                numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-                #print("numberOfchannels = ", numberOfchannels)
-                #print("numChannelPairs = ", numChannelPairs)
-                sparseLayerList[c] = []
-                numberOfInputChannels = 2
-                numberOfOutputChannels = 1
-                for channelPairIndex in range(numChannelPairs):
-                    layer = self.generateLayer(numberOfInputChannels, numberOfOutputChannels)
-                    sparseLayerList[c].append(layer)
-                if(self.isCNNmodel):
-                    self.height, self.width = self.getImageDimensionsAfterConv(self.height, self.width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
-                numberOfchannels = numChannelPairs*numberOfOutputChannels
-            else:
-                if(self.isCNNmodel):
-                    #only used by CNN originally:
-                    numberOfInputChannels = numberOfchannels
-                    numberOfOutputChannels = numberOfchannels*2
-                    layer = self.generateLayer(numberOfchannels, numberOfOutputChannels)
-                    if(self.isCNNmodel):
-                        self.height, self.width = self.getImageDimensionsAfterConv(self.height, self.width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
-                    self.sparseConvList[c] = layer
-                    numberOfchannels = numberOfOutputChannels
-
-        return numberOfchannels
-
-    def generateLayer(self, numberOfInputChannels, numberOfOutputChannels):
-        return self.generateLayerLNN(numberOfInputChannels, numberOfOutputChannels)
-
-    def generateLayerLNN(self, numberOfInputChannels, numberOfOutputChannels):
-        layer = nn.Linear(numberOfInputChannels, numberOfOutputChannels)
-        return layer
 
     def forward(self, x, **kwargs):
 
         #first/dense linear layer
         x = self.linear1(x)
-        x = self.activationFunction(x)
+        x = self.sparseLayerProcessing.activationFunction(x)
 
-        x = self.executeSparseLayers(x)
+        x = self.sparseLayerProcessing.executeSparseLayers(x)
 
         if(onlyTrainFinalLayer):
             x = x.detach()
@@ -196,71 +404,6 @@ class MLPModel(nn.Module):
         x = F.softmax(self.output(x), dim=-1)
 
         return x
-
-    def executeSparseLayers(self, X):
-
-        numberOfchannels = self.numberOfchannelsFirstDenseLayer
-
-        for c in range(self.numberOfSparseLayers):
-            if(useSparseNetwork):
-                numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-                channelsPairsList = self.convertToChannelsToChannelPairsList(X)
-                channelPairSublayerOutputList = []
-                numberOfInputChannels = 2
-                numberOfOutputChannels = 1
-                for channelPairIndex in range(numChannelPairs):
-                    sublayerIn = channelsPairsList[channelPairIndex]
-                    sublayerOut = (self.sparseLayerList[c])[channelPairIndex](sublayerIn)
-                    sublayerOut = torch.squeeze(sublayerOut, dim=1)   #remove channel dim (size=numberOfOutputChannels=1); prepare for convertChannelPairLINoutputListToChannels execution
-                    channelPairSublayerOutputList.append(sublayerOut)
-                layerOut = self.convertChannelPairSublayerOutputListToChannels(channelPairSublayerOutputList)
-                numberOfchannels = numChannelPairs*numberOfOutputChannels
-            else:
-                layerIn = X
-                layerOut = (self.sparseLayerList[c])(layerIn)
-            layerOut = self.activationFunction(layerOut)
-            X = layerOut
-        
-        return X
-
-    def activationFunction(self, Z):
-        A = F.relu(Z)
-        A = self.dropout(A)
-        return A
-
-    def calculateNumberChannelPairs(self, numInputChannels):
-        numChannelPairs = numInputChannels**2
-        return numChannelPairs
-        #numOutputChannels = number of filters
-
-    def convertToChannelsToChannelPairsList(self, channels):
-        res = self.getSublayerTensorProperties(channels)
-        batchSize = res[0]
-        numberOfchannels = res[1]
-        numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-        channelsPairsList = []
-        for channelIndex1 in range(numberOfchannels):
-            for channelIndex2 in range(numberOfchannels):
-                channelPairIndex = channelIndex1*numChannelPairs + channelIndex2
-                channelPairSub1 = channels[:, channelIndex1]  #channels[:, channelIndex1, :]
-                channelPairSub2 = channels[:, channelIndex2]  #channels[:, channelIndex2, :]
-                channelPairSub1 = torch.unsqueeze(channelPairSub1, dim=1)
-                channelPairSub2 = torch.unsqueeze(channelPairSub2, dim=1)
-                channelPair = torch.cat((channelPairSub1, channelPairSub2), dim=1)
-                channelsPairsList.append(channelPair)
-        return channelsPairsList
-
-    def getSublayerTensorProperties(self, channels):
-       return self.getLINtensorProperties(channels)
-
-    def getLINtensorProperties(self, channels):
-        batchSize = channels.shape[0]
-        numberOfchannels = channels.shape[1]
-        return (batchSize, numberOfchannels)
-
-    def convertChannelPairSublayerOutputListToChannels(self, channelPairSublayerOutputList):
-        channels = torch.stack(channelPairSublayerOutputList, dim=1)
-        return channels
 
 """skorch allows to use PyTorch's networks in the SciKit-Learn setting:"""
 
@@ -319,78 +462,38 @@ class CNNModel(nn.Module):
 
         self.isCNNmodel = True
 
-        self.height = 28 #MNIST defined
-        self.width = 28  #MNIST defined
+        height = 28 #MNIST defined
+        width = 28  #MNIST defined
         self.kernelSize = 3
         self.padding = 0
         self.stride = 1
         self.maxPoolSize = 2 #assume max pool at each layer
 
-        self.numberOfSparseLayers = 1 #default: 1 (1 or 2)
-        if(self.numberOfSparseLayers == 1):
-            self.numberOfchannelsFirstDenseLayer = 32   #first/dense CNN layer
-        elif(self.numberOfSparseLayers == 2):
-            self.numberOfchannelsFirstDenseLayer = 8    #first/dense CNN layer 
-        else:
-            print("useSparseNetwork warning: numberOfSparseConvolutionLayers is too high for compute/memory")
-            self.numberOfchannelsFirstDenseLayer = 2
+        self.conv2_drop = nn.Dropout2d(p=dropout)
+
+        self.numberOfSparseLayers = numberOfSparseLayersCNN #default: 1 (1 or 2)
+        self.numberOfchannelsFirstDenseLayer = numberOfchannelsFirstDenseLayerCNN
 
         numberOfchannels = self.numberOfchannelsFirstDenseLayer  
-        self.conv1 = nn.Conv2d(1, numberOfchannels, kernel_size=self.kernelSize, padding=self.padding, stride=self.stride)
-        self.height, self.width = self.getImageDimensionsAfterConv(self.height, self.width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
+        self.conv1 = nn.Conv2d(1, numberOfchannels, kernel_size=self.kernelSize, padding=self.padding, stride=self.stride)  #first/dense linear layer
 
-        self.sparseLayerList = [None]*self.numberOfSparseLayers
-        numberOfchannels = self.generateSparseLayers(numberOfchannels, self.sparseLayerList, self.numberOfSparseLayers)
+        self.sparseLayerProcessing = SparseLayerProcessing(self.isCNNmodel, self.numberOfSparseLayers, self.conv2_drop, self.numberOfchannelsFirstDenseLayer, kernelSize=self.kernelSize, padding=self.padding, stride=self.stride, maxPoolSize=self.maxPoolSize)
+        
+        height, width = self.sparseLayerProcessing.getImageDimensionsAfterConv(height, width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
+        numberOfchannels, width, height = self.sparseLayerProcessing.generateSparseLayers(numberOfchannels, height, width)
 
-        firstLinearInputSize = numberOfchannels*self.width*self.height
+        firstLinearInputSize = numberOfchannels*width*height
 
-        self.conv2_drop = nn.Dropout2d(p=dropout)
         self.fc1 = nn.Linear(firstLinearInputSize, 100)
         self.fc2 = nn.Linear(100, 10)
         self.fc1_drop = nn.Dropout(p=dropout)
 
-    def generateSparseLayers(self, numberOfchannels, sparseLayerList, numberOfSparseLayers):
-        for c in range(numberOfSparseLayers):
-            #print("c = ", c)
-            if(useSparseNetwork):
-                numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-                #print("numberOfchannels = ", numberOfchannels)
-                #print("numChannelPairs = ", numChannelPairs)
-                sparseLayerList[c] = []
-                numberOfInputChannels = 2
-                numberOfOutputChannels = 1
-                for channelPairIndex in range(numChannelPairs):
-                    layer = self.generateLayer(numberOfInputChannels, numberOfOutputChannels)
-                    sparseLayerList[c].append(layer)
-                if(self.isCNNmodel):
-                    self.height, self.width = self.getImageDimensionsAfterConv(self.height, self.width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
-                numberOfchannels = numChannelPairs*numberOfOutputChannels
-            else:
-                if(self.isCNNmodel):
-                    #only used by CNN originally:
-                    numberOfInputChannels = numberOfchannels
-                    numberOfOutputChannels = numberOfchannels*2
-                    layer = self.generateLayer(numberOfchannels, numberOfOutputChannels)
-                    if(self.isCNNmodel):
-                        self.height, self.width = self.getImageDimensionsAfterConv(self.height, self.width, self.kernelSize, self.padding, self.stride, self.maxPoolSize)
-                    self.sparseConvList[c] = layer
-                    numberOfchannels = numberOfOutputChannels
-
-        return numberOfchannels
-
-    def generateLayer(self, numberOfInputChannels, numberOfOutputChannels):
-        return self.generateLayerCNN(numberOfInputChannels, numberOfOutputChannels)
-
-    def generateLayerCNN(self, numberOfInputChannels, numberOfOutputChannels):
-        layer = nn.Conv2d(numberOfInputChannels, numberOfOutputChannels, kernel_size=self.kernelSize, padding=self.padding, stride=self.stride)
-        return layer
-
     def forward(self, x):
 
         x = self.conv1(x)
-        x = self.activationFunction(x, useDropOut=False)
+        x = self.sparseLayerProcessing.activationFunction(x, useDropOut=False)
 
-        x = self.executeSparseLayers(x)
+        x = self.sparseLayerProcessing.executeSparseLayers(x)
 
         if(onlyTrainFinalLayer):
             x = x.detach()
@@ -402,79 +505,6 @@ class CNNModel(nn.Module):
         x = torch.softmax(self.fc2(x), dim=-1)
 
         return x
-
-    def executeSparseLayers(self, X):
-
-        numberOfchannels = self.numberOfchannelsFirstDenseLayer
-
-        for c in range(self.numberOfSparseLayers):
-            if(useSparseNetwork):
-                numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-                channelsPairsList = self.convertToChannelsToChannelPairsList(X)
-                channelPairSublayerOutputList = []
-                numberOfInputChannels = 2
-                numberOfOutputChannels = 1
-                for channelPairIndex in range(numChannelPairs):
-                    sublayerIn = channelsPairsList[channelPairIndex]
-                    sublayerOut = (self.sparseLayerList[c])[channelPairIndex](sublayerIn)
-                    sublayerOut = torch.squeeze(sublayerOut, dim=1)   #remove channel dim (size=numberOfOutputChannels=1); prepare for convertChannelPairLINoutputListToChannels execution
-                    channelPairSublayerOutputList.append(sublayerOut)
-                layerOut = self.convertChannelPairSublayerOutputListToChannels(channelPairSublayerOutputList)
-                numberOfchannels = numChannelPairs*numberOfOutputChannels
-            else:
-                layerIn = X
-                layerOut = (self.sparseLayerList[c])(layerIn)
-            layerOut = self.activationFunction(layerOut)
-            X = layerOut
-        
-        return X
-
-    def activationFunction(self, Z, useDropOut=True):
-        if(useDropOut):
-            Z = self.conv2_drop(Z)
-        A = torch.relu(F.max_pool2d(Z, kernel_size=self.maxPoolSize))
-        return A
-
-    def getImageDimensionsAfterConv(self, inputHeight, inputWidth, kernelSize, padding, stride, maxPoolSize):
-        height = (inputHeight - (kernelSize//2 * 2) + padding) // stride // maxPoolSize    #// = integer floor division
-        width = (inputWidth - (kernelSize//2 * 2) + padding) // stride // maxPoolSize
-        return height, width
-
-    def calculateNumberChannelPairs(self, numInputChannels):
-        numChannelPairs = numInputChannels**2
-        return numChannelPairs
-        #numOutputChannels = number of filters
-
-    def convertToChannelsToChannelPairsList(self, channels):
-        res = self.getSublayerTensorProperties(channels)
-        batchSize = res[0]
-        numberOfchannels = res[1]
-        numChannelPairs = self.calculateNumberChannelPairs(numberOfchannels)
-        channelsPairsList = []
-        for channelIndex1 in range(numberOfchannels):
-            for channelIndex2 in range(numberOfchannels):
-                channelPairIndex = channelIndex1*numChannelPairs + channelIndex2
-                channelPairSub1 = channels[:, channelIndex1]  #channels[:, channelIndex1, :, :]
-                channelPairSub2 = channels[:, channelIndex2]  #channels[:, channelIndex1, :, :]
-                channelPairSub1 = torch.unsqueeze(channelPairSub1, dim=1)
-                channelPairSub2 = torch.unsqueeze(channelPairSub2, dim=1)
-                channelPair = torch.cat((channelPairSub1, channelPairSub2), dim=1)
-                channelsPairsList.append(channelPair)
-        return channelsPairsList
-
-    def getSublayerTensorProperties(self, channels):
-       return self.getCNNtensorProperties(channels)
-
-    def getCNNtensorProperties(self, channels):
-        batchSize = channels.shape[0]
-        numberOfchannels = channels.shape[1]
-        height = channels.shape[2]
-        width = channels.shape[3]
-        return (batchSize, numberOfchannels, height, width)
-
-    def convertChannelPairSublayerOutputListToChannels(self, channelPairSublayerOutputList):
-        channels = torch.stack(channelPairSublayerOutputList, dim=1)
-        return channels
 
 torch.manual_seed(0)
 
